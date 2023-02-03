@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #define MQ_NAME_LEN  (8)
 #define MQ_MAX_ITEMS (10)
@@ -12,7 +13,7 @@
 #    include <rtthread.h>
 #    define upi_printf rt_kprintf
 #    define upi_malloc rt_malloc
-#    define upi_free   rt_fee
+#    define upi_free   rt_free
 #    define upi_calloc rt_calloc
 #    define upi_memset rt_memset
 #    define upi_memcpy rt_memcpy
@@ -21,7 +22,6 @@
 #    include <rtdbg.h>
 #    define LOG LOG_D
 #else
-#    include <stdio.h>
 #    include <string.h>
 #    define upi_printf printf
 #    define upi_malloc malloc
@@ -43,6 +43,7 @@ typedef struct interactor {
     size_t          rx_buf_size;
     mqd_t           rx_mq;
     char            mq_name[MQ_NAME_LEN];
+    bool add_to_mq;
 } interactor, *_interactor_t;
 
 typedef struct intr_msg {
@@ -51,7 +52,7 @@ typedef struct intr_msg {
 } intr_msg, *intr_msg_t;
 
 typedef struct {
-    const upi_urm_rom *rom;\
+    const upi_urm_rom *rom;
     intr_msg_t msg;
 }urm_thread_param, *urm_thread_param_t;
 
@@ -94,12 +95,14 @@ static void *intercatorReadThread(void *param) {
             intr_msg_t msg = upi_malloc(sizeof(intr_msg));
             msg->buf = upi_malloc(size);
             msg->len = size;
-            if (msg->buf != NULL) {
+            if (intr->add_to_mq == true ) {
                 upi_memcpy(msg->buf, intr->rx_buf, msg->len);
-                if (!inURMROM(intr, msg)) {
-                    int ret = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
-                    upi_free(msg);
-                }
+                int ret = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
+                LOG("mq_send ret = %d", ret);
+                intr->add_to_mq = false;
+            } else if (msg->buf != NULL) {
+                upi_memcpy(msg->buf, intr->rx_buf, msg->len);
+                inURMROM(intr, msg);
             }
         }
         LOG("read thread running.");
@@ -172,17 +175,42 @@ void intercatorDelete(interactor_t intr) {
 bool intercatorRequest(interactor_t intr, void *req, size_t req_len, void *resp, size_t *resp_len, uint32_t timeout_ms) {
     if (intr != NULL) {
         _interactor_t  _intr = (_interactor_t)intr;
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
         struct timespec ts;
-        uint64_t        nsec = (uint64_t)(tv.tv_usec) * 1000 + (uint64_t)(timeout_ms)*1000 * 1000;
-        ts.tv_sec            = tv.tv_sec + (nsec / 1000000000ULL);
-        ts.tv_nsec           = nsec % 1000000000ULL;
-        intr_msg msg;
-        ssize_t  ret = mq_timedreceive(_intr->rx_mq, (char *)&msg, sizeof(intr_msg), 0, &ts);
+        ssize_t  ret = -1;
+
+        // 1. lock the request
+        pthread_mutex_lock(&_intr->lock);
+        if (resp != NULL)
+            _intr->add_to_mq = true;
+        // 2. send request
+        ret = write(_intr->fd, req, req_len);
         if (ret <= 0) {
+            goto  __unlock;
+        }
+        // 3. recv request
+        clock_gettime(CLOCK_REALTIME, &ts);
+        LOG("tick = %d", rt_timespec_to_tick(&ts));
+        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", ts.tv_sec, ts.tv_nsec);
+        ts.tv_sec            += (timeout_ms / 1000);
+        ts.tv_nsec           += ((timeout_ms % 1000) * 1000ULL);
+        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", ts.tv_sec, ts.tv_nsec);
+        intr_msg msg;
+        ret = mq_timedreceive(_intr->rx_mq, (char *)&msg, sizeof(intr_msg), 0, &ts);
+__unlock:
+        // 4. unlock the request
+        pthread_mutex_unlock(&_intr->lock);
+        if (ret <= 0) {
+            _intr->add_to_mq = false;
             LOG("request error.");
         } else {
+            // 5. copy data to user
+            if (resp != 0) {
+                if (*resp_len != 0)
+                    *resp_len = ((*resp_len)>(msg.len))?msg.len:(*resp_len);
+                else 
+                    *resp_len = msg.len;
+                upi_memcpy(resp, msg.buf, *resp_len);
+            }
             LOG("Request: %.*s", (int)msg.len, (char *)msg.buf);
             upi_free(msg.buf);
         }

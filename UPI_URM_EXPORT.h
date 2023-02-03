@@ -27,13 +27,15 @@ typedef struct {
     upi_urm_callback_func callback;
 } upi_urm_rom, *upi_urm_rom_t;
 
+#ifdef __GNUC__
 #define upi_urm_export(filter, callback)                                                                                                   \
     __attribute__((used)) const static upi_urm_rom __upi_urm_rom_##filter##_##callback                                                     \
         __attribute__((section(".upi_urm"))) = {filter, callback}
-
-#ifdef __GNUC__
 extern size_t __upi_urm_start, __upi_urm_end;
 #else
+#define upi_urm_export(filter, callback)                                                                                                   \
+    __attribute__((used)) const static upi_urm_rom __upi_urm_rom_##filter##_##callback                                                     \
+        __attribute__((section("upi_urm"))) = {filter, callback}
 extern size_t upi_urm$$Base;
 extern size_t upi_urm$$Limit;
 #    define __upi_urm_start upi_urm$$Base
