@@ -2,9 +2,9 @@
 #include <fcntl.h>
 #include <mqueue.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <stdio.h>
 
 #define MQ_NAME_LEN  (8)
 #define MQ_MAX_ITEMS (10)
@@ -31,7 +31,7 @@
 #    define upi_memcpy memcpy
 #    define LOG(FMT, ...)                                                                                                                  \
         do {                                                                                                                               \
-            upi_printf("[%s:%d] " FMT "\r\n", __func__, __LINE__, ##__VA_ARGS__);                                           \
+            upi_printf("[upi:%s] " FMT "\r\n", __func__, ##__VA_ARGS__);                                                                   \
         } while (0)
 #endif
 
@@ -43,7 +43,7 @@ typedef struct interactor {
     size_t          rx_buf_size;
     mqd_t           rx_mq;
     char            mq_name[MQ_NAME_LEN];
-    bool add_to_mq;
+    bool            add_to_mq;
 } interactor, *_interactor_t;
 
 typedef struct intr_msg {
@@ -53,17 +53,23 @@ typedef struct intr_msg {
 
 typedef struct {
     const upi_urm_rom *rom;
-    intr_msg_t msg;
-}urm_thread_param, *urm_thread_param_t;
+    intr_msg_t         msg;
+} urm_thread_param, *urm_thread_param_t;
 
-static void *interactorRUMCallback(void *param) {
-    urm_thread_param_t urm_param = (urm_thread_param_t)param;
-    
-    urm_param->rom->callback(urm_param->msg->buf, urm_param->msg->len);
+static pthread_t   taskQueueTid = 0;
+static size_t      intrCounter  = 0;
+static mqd_t       taskMq       = -1;
+const static char *taskMqName   = "/intrMq";
 
-    upi_free(urm_param->msg->buf);
-    upi_free(urm_param->msg);
-    upi_free(urm_param);
+static void *interactorTaskQueueThread(void *param) {
+    (void)param;
+    while (1) {
+        urm_thread_param urm_param;
+        mq_receive(taskMq, (char *)&urm_param, sizeof(urm_thread_param), 0);
+        urm_param.rom->callback(urm_param.msg->buf, urm_param.msg->len);
+        upi_free(urm_param.msg->buf);
+        upi_free(urm_param.msg);
+    }
     return NULL;
 }
 
@@ -71,13 +77,11 @@ static bool inURMROM(_interactor_t intr, intr_msg_t msg) {
     for (upi_urm_rom *rom = (upi_urm_rom_t)&__upi_urm_start; rom < (upi_urm_rom_t)&__upi_urm_end; ++rom) {
         if (rom->filter != 0 && rom->callback != 0) {
             if (rom->filter((interactor_t)intr, msg->buf, msg->len) == true) {
-                urm_thread_param_t upi_param = upi_malloc(sizeof(urm_thread_param));
-                upi_param->rom = rom;
-                upi_param->msg = msg;
-                pthread_t tid;
-                int ret = pthread_create(&tid, NULL, interactorRUMCallback, upi_param);
-                LOG("create thread tid: %ul, ret: %d", tid, ret);
-                pthread_detach(tid);
+                urm_thread_param urm_param;
+                urm_param.rom = rom;
+                urm_param.msg = msg;
+                int ret       = mq_send(taskMq, (const char *)&urm_param, sizeof(urm_thread_param), 0);
+                LOG("mq: %d, ret: %d", taskMq, ret);
                 return true;
             }
         }
@@ -85,17 +89,16 @@ static bool inURMROM(_interactor_t intr, intr_msg_t msg) {
     return false;
 }
 
-static void *intercatorReadThread(void *param) {
+static void *interactorReadThread(void *param) {
     _interactor_t intr = (_interactor_t)param;
-    // sleep(1);
     while (1) {
         ssize_t size = read(intr->fd, intr->rx_buf, intr->rx_buf_size);
-        LOG("read.size: %d", size);
+        LOG("read.size: %d", (int)size);
         if (size > 0) {
             intr_msg_t msg = upi_malloc(sizeof(intr_msg));
-            msg->buf = upi_malloc(size);
-            msg->len = size;
-            if (intr->add_to_mq == true ) {
+            msg->buf       = upi_malloc(size);
+            msg->len       = size;
+            if (intr->add_to_mq == true) {
                 upi_memcpy(msg->buf, intr->rx_buf, msg->len);
                 int ret = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
                 LOG("mq_send ret = %d", ret);
@@ -111,10 +114,30 @@ static void *intercatorReadThread(void *param) {
     }
 }
 
-interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t rx_thread_stack_size) {
+interactor_t interactorCreate(const char *filename, size_t rx_buf_size, pthread_attr_t *t_attr) {
     _interactor_t ret   = (_interactor_t)upi_malloc(sizeof(interactor));
     static int    count = 0;
     if (ret != NULL) {
+        if (intrCounter == 0) {
+            struct mq_attr _mq_attr;
+            _mq_attr.mq_flags   = 0;
+            _mq_attr.mq_maxmsg  = MQ_MAX_ITEMS;
+            _mq_attr.mq_msgsize = sizeof(urm_thread_param);
+            taskMq              = mq_open(taskMqName, O_RDWR | O_CREAT, 066, &_mq_attr);
+            if (taskMq <= 0) {
+                LOG("create intr messagequeue error.");
+                goto __exit;
+            } else {
+                if (pthread_create(&taskQueueTid, NULL, interactorTaskQueueThread, NULL) != 0) {
+                    LOG("creat taskQueue error.");
+                    goto __exit;
+                } else {
+                    intrCounter++;
+                }
+            }
+        } else {
+            intrCounter++;
+        }
         upi_memset(ret, 0, sizeof(interactor));
         if (pthread_mutex_init(&ret->lock, NULL) != 0) {
             goto __exit;
@@ -134,7 +157,7 @@ interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t r
         if (ret->rx_mq <= 0) {
             goto __exit;
         }
-        if (pthread_create(&ret->rx_thread, NULL, intercatorReadThread, ret) != 0) {
+        if (pthread_create(&ret->rx_thread, t_attr, interactorReadThread, ret) != 0) {
             goto __exit;
         }
         ++count;
@@ -142,72 +165,85 @@ interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t r
     return ret;
 __exit:
     LOG("intr creat error.");
-    intercatorDelete(ret);
+    interactorDelete(ret);
     return NULL;
 }
 
-void intercatorDelete(interactor_t intr) {
+void interactorDelete(interactor_t intr) {
     if (intr != NULL) {
-        _interactor_t inter = (_interactor_t)intr;
-        if (inter->fd > 0) {
-            close(inter->fd);
+        _interactor_t _intr = (_interactor_t)intr;
+        if (_intr->fd > 0) {
+            close(_intr->fd);
         } else {
-            LOG("fd:%d open failed.", inter->fd);
+            LOG("fd:%d open failed.", _intr->fd);
         }
-        pthread_mutex_destroy(&inter->lock);
-        if (inter->rx_buf != 0) {
-            upi_free(inter->rx_buf);
+        pthread_mutex_destroy(&_intr->lock);
+        if (_intr->rx_buf != 0) {
+            upi_free(_intr->rx_buf);
         } else {
             LOG("low memory.");
         }
-        if (inter->rx_thread != 0) {
-            pthread_cancel(inter->rx_thread);
-        }else {
+        if (_intr->rx_thread != 0) {
+            pthread_cancel(_intr->rx_thread);
+            pthread_join(_intr->rx_thread, NULL);
+        } else {
             LOG("read thread creat error.");
         }
-        pthread_join(inter->rx_thread, NULL);
-        mq_close(inter->rx_mq);
-        mq_unlink(inter->mq_name);
-        upi_free(inter);
+        mq_close(_intr->rx_mq);
+        mq_unlink(_intr->mq_name);
+        upi_free(_intr);
+
+        if (intrCounter > 0) {
+            intrCounter--;
+        }
+        if (intrCounter == 0) {
+            if (taskQueueTid != 0) {
+                pthread_cancel(taskQueueTid);
+                pthread_join(taskQueueTid, NULL);
+            }
+            if (taskMq > 0) {
+                mq_close(taskMq);
+                mq_unlink(taskMqName);
+            }
+        }
     }
 }
 
-bool intercatorRequest(interactor_t intr, void *req, size_t req_len, void *resp, size_t *resp_len, uint32_t timeout_ms) {
+bool interactorRequest(interactor_t intr, void *req, size_t req_len, void *resp, size_t *resp_len, uint32_t timeout_ms) {
     if (intr != NULL) {
-        _interactor_t  _intr = (_interactor_t)intr;
+        _interactor_t   _intr = (_interactor_t)intr;
         struct timespec ts;
-        ssize_t  ret = -1;
+        ssize_t         ret = -1;
 
         // 1. lock the request
         pthread_mutex_lock(&_intr->lock);
-        if (resp != NULL)
-            _intr->add_to_mq = true;
+        _intr->add_to_mq = true;
         // 2. send request
         ret = write(_intr->fd, req, req_len);
         if (ret <= 0) {
-            goto  __unlock;
+            goto __unlock;
         }
         // 3. recv request
         clock_gettime(CLOCK_REALTIME, &ts);
-        LOG("tick = %d", rt_timespec_to_tick(&ts));
-        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", ts.tv_sec, ts.tv_nsec);
-        ts.tv_sec            += (timeout_ms / 1000);
-        ts.tv_nsec           += ((timeout_ms % 1000) * 1000ULL);
-        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", ts.tv_sec, ts.tv_nsec);
+        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", (int)ts.tv_sec, (int)ts.tv_nsec);
+        ts.tv_sec += (timeout_ms / 1000);
+        ts.tv_nsec += ((timeout_ms % 1000) * 1000ULL);
+        LOG("ts.tv_sec = %d, ts.tv_nsec = %d", (int)ts.tv_sec, (int)ts.tv_nsec);
         intr_msg msg;
         ret = mq_timedreceive(_intr->rx_mq, (char *)&msg, sizeof(intr_msg), 0, &ts);
-__unlock:
+    __unlock:
         // 4. unlock the request
         pthread_mutex_unlock(&_intr->lock);
         if (ret <= 0) {
             _intr->add_to_mq = false;
             LOG("request error.");
+            while(1);
         } else {
             // 5. copy data to user
             if (resp != 0) {
                 if (*resp_len != 0)
-                    *resp_len = ((*resp_len)>(msg.len))?msg.len:(*resp_len);
-                else 
+                    *resp_len = ((*resp_len) > (msg.len)) ? msg.len : (*resp_len);
+                else
                     *resp_len = msg.len;
                 upi_memcpy(resp, msg.buf, *resp_len);
             }

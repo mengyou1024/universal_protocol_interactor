@@ -25,11 +25,14 @@ void callback(uint8_t *buf, size_t len) {
 upi_urm_export(filter,callback);
 
 int main(int argc, char *argv[]) {
-    gintr = intercatorCreate("/home/djkj24/WorkSpaces/Universal_Protocol_Interactor/test/123.txt", 1024, 1024);
-    gintr2 = intercatorCreate("/home/djkj24/WorkSpaces/Universal_Protocol_Interactor/test/123.txt", 1024, 1024);
-    intercatorRequest(gintr, NULL, 0, NULL, NULL, 5000);
+    // mq_unlink("/intr00");
+    // mq_unlink("/intr01");
+    // mq_unlink("/intrMq");
+    gintr = interactorCreate("/home/djkj24/WorkSpaces/Universal_Protocol_Interactor/test/123.txt", 1024, NULL);
+    gintr2 = interactorCreate("/home/djkj24/WorkSpaces/Universal_Protocol_Interactor/test/123.txt", 1024, NULL);
+    interactorRequest(gintr, "123123", 6, NULL, NULL, 5000);
     sleep(2);
-    intercatorDelete(gintr);
-    intercatorDelete(gintr2);
+    interactorDelete(gintr);
+    interactorDelete(gintr2);
     return EXIT_SUCCESS;
 }
