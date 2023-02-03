@@ -58,7 +58,7 @@ typedef struct {
 
 static pthread_t   taskQueueTid = 0;
 static size_t      intrCounter  = 0;
-static mqd_t       taskMq       = -1;
+static mqd_t       taskMq       = 0;
 const static char *taskMqName   = "/intrMq";
 
 static void *interactorTaskQueueThread(void *param) {
@@ -70,7 +70,6 @@ static void *interactorTaskQueueThread(void *param) {
         upi_free(urm_param.msg->buf);
         upi_free(urm_param.msg);
     }
-    return NULL;
 }
 
 static bool inURMROM(_interactor_t intr, intr_msg_t msg) {
@@ -237,10 +236,9 @@ bool interactorRequest(interactor_t intr, void *req, size_t req_len, void *resp,
         if (ret <= 0) {
             _intr->add_to_mq = false;
             LOG("request error.");
-            while(1);
         } else {
             // 5. copy data to user
-            if (resp != 0) {
+            if (resp_len != NULL && resp != NULL) {
                 if (*resp_len != 0)
                     *resp_len = ((*resp_len) > (msg.len)) ? msg.len : (*resp_len);
                 else
