@@ -1,7 +1,7 @@
 #include "universalProtocolInteractor.h"
+#include <fcntl.h>
 #include <mqueue.h>
 #include <pthread.h>
-#include <sys/fcntl.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -16,6 +16,10 @@
 #    define upi_calloc rt_calloc
 #    define upi_memset rt_memset
 #    define upi_memcpy rt_memcpy
+#    define DBG_TAG    "upi"
+#    define DBG_LVL    DBG_LOG
+#    include <rtdbg.h>
+#    define LOG LOG_D
 #else
 #    include <stdio.h>
 #    include <string.h>
@@ -25,12 +29,11 @@
 #    define upi_calloc calloc
 #    define upi_memset memset
 #    define upi_memcpy memcpy
+#    define LOG(FMT, ...)                                                                                                                  \
+        do {                                                                                                                               \
+            upi_printf("[%s:%d] " FMT "\r\n", __func__, __LINE__, ##__VA_ARGS__);                                           \
+        } while (0)
 #endif
-
-#define LOG(FMT, ...)                                                                                                                      \
-    do {                                                                                                                                   \
-        upi_printf("[%s] [%s:%d] " FMT "\r\n", __FILE__, __func__, __LINE__, ##__VA_ARGS__);                                               \
-    } while (0)
 
 typedef struct interactor {
     pthread_mutex_t lock;
@@ -47,28 +50,61 @@ typedef struct intr_msg {
     size_t   len;
 } intr_msg, *intr_msg_t;
 
-void *hello(void *args) {
-    while (1) {
-        LOG("hello world.");
-        usleep(1000 * 100);
+typedef struct {
+    const upi_urm_rom *rom;\
+    intr_msg_t msg;
+}urm_thread_param, *urm_thread_param_t;
+
+static void *interactorRUMCallback(void *param) {
+    urm_thread_param_t urm_param = (urm_thread_param_t)param;
+    
+    urm_param->rom->callback(urm_param->msg->buf, urm_param->msg->len);
+
+    upi_free(urm_param->msg->buf);
+    upi_free(urm_param->msg);
+    upi_free(urm_param);
+    return NULL;
+}
+
+static bool inURMROM(_interactor_t intr, intr_msg_t msg) {
+    for (upi_urm_rom *rom = (upi_urm_rom_t)&__upi_urm_start; rom < (upi_urm_rom_t)&__upi_urm_end; ++rom) {
+        if (rom->filter != 0 && rom->callback != 0) {
+            if (rom->filter((interactor_t)intr, msg->buf, msg->len) == true) {
+                urm_thread_param_t upi_param = upi_malloc(sizeof(urm_thread_param));
+                upi_param->rom = rom;
+                upi_param->msg = msg;
+                pthread_t tid;
+                int ret = pthread_create(&tid, NULL, interactorRUMCallback, upi_param);
+                LOG("create thread tid: %ul, ret: %d", tid, ret);
+                pthread_detach(tid);
+                return true;
+            }
+        }
     }
+    return false;
 }
 
 static void *intercatorReadThread(void *param) {
     _interactor_t intr = (_interactor_t)param;
+    // sleep(1);
     while (1) {
         ssize_t size = read(intr->fd, intr->rx_buf, intr->rx_buf_size);
+        LOG("read.size: %d", size);
         if (size > 0) {
-            intr_msg msg;
-            msg.buf = upi_malloc(size);
-            msg.len = size;
-            if (msg.buf != NULL) {
-                upi_memcpy(msg.buf, intr->rx_buf, msg.len);
-                int ret = mq_send(intr->rx_mq, (const char *)&msg, sizeof(intr_msg), 0);
-                LOG("send ret: %d", ret);
+            intr_msg_t msg = upi_malloc(sizeof(intr_msg));
+            msg->buf = upi_malloc(size);
+            msg->len = size;
+            if (msg->buf != NULL) {
+                upi_memcpy(msg->buf, intr->rx_buf, msg->len);
+                if (!inURMROM(intr, msg)) {
+                    int ret = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
+                    upi_free(msg);
+                }
             }
         }
+        LOG("read thread running.");
         sleep(1);
+        lseek(intr->fd, 0, SEEK_SET);
     }
 }
 
@@ -80,10 +116,7 @@ interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t r
         if (pthread_mutex_init(&ret->lock, NULL) != 0) {
             goto __exit;
         }
-        ret->fd = open(filename, O_RDWR);
-        if (pthread_create(&ret->rx_thread, NULL, intercatorReadThread, ret) != 0) {
-            goto __exit;
-        }
+        ret->fd          = open(filename, O_RDWR);
         ret->rx_buf_size = rx_buf_size;
         ret->rx_buf      = upi_malloc(rx_buf_size);
         if (ret->rx_buf == NULL) {
@@ -98,10 +131,14 @@ interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t r
         if (ret->rx_mq <= 0) {
             goto __exit;
         }
+        if (pthread_create(&ret->rx_thread, NULL, intercatorReadThread, ret) != 0) {
+            goto __exit;
+        }
         ++count;
     }
     return ret;
 __exit:
+    LOG("intr creat error.");
     intercatorDelete(ret);
     return NULL;
 }
@@ -111,12 +148,21 @@ void intercatorDelete(interactor_t intr) {
         _interactor_t inter = (_interactor_t)intr;
         if (inter->fd > 0) {
             close(inter->fd);
+        } else {
+            LOG("fd:%d open failed.", inter->fd);
         }
         pthread_mutex_destroy(&inter->lock);
         if (inter->rx_buf != 0) {
             upi_free(inter->rx_buf);
+        } else {
+            LOG("low memory.");
         }
-        pthread_cancel(inter->rx_thread);
+        if (inter->rx_thread != 0) {
+            pthread_cancel(inter->rx_thread);
+        }else {
+            LOG("read thread creat error.");
+        }
+        pthread_join(inter->rx_thread, NULL);
         mq_close(inter->rx_mq);
         mq_unlink(inter->mq_name);
         upi_free(inter);

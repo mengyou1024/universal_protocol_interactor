@@ -10,15 +10,11 @@
  */
 #pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
+#include "UPI_URM_EXPORT.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef void *interactor_t;
 
 interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t rx_thread_stack_size);
 
