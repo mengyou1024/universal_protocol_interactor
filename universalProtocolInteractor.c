@@ -94,7 +94,7 @@ interactor_t intercatorCreate(const char *filename, size_t rx_buf_size, size_t r
         _mq_attr.mq_flags   = 0;
         _mq_attr.mq_maxmsg  = MQ_MAX_ITEMS;
         _mq_attr.mq_msgsize = sizeof(intr_msg);
-        ret->rx_mq          = mq_open(ret->mq_name, O_RDWR|O_CREAT, 066, &_mq_attr);
+        ret->rx_mq          = mq_open(ret->mq_name, O_RDWR | O_CREAT, 066, &_mq_attr);
         if (ret->rx_mq <= 0) {
             goto __exit;
         }
@@ -137,7 +137,7 @@ bool intercatorRequest(interactor_t intr, void *req, size_t req_len, void *resp,
         if (ret <= 0) {
             LOG("request error.");
         } else {
-            LOG("Request: %.*s", msg.len, (char *)msg.buf);
+            LOG("Request: %.*s", (int)msg.len, (char *)msg.buf);
             upi_free(msg.buf);
         }
     }
