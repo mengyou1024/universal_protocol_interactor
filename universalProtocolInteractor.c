@@ -6,8 +6,10 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define MQ_NAME_LEN  (8)
-#define MQ_MAX_ITEMS (10)
+#define MQ_NAME_LEN    (8)
+#define MQ_MAX_ITEMS   (10)
+
+#define INTR_USING_LOG (1)
 
 #ifdef __RTTHREAD__
 #    include <rtthread.h>
@@ -20,7 +22,11 @@
 #    define DBG_TAG    "upi"
 #    define DBG_LVL    DBG_LOG
 #    include <rtdbg.h>
-#    define LOG LOG_D
+#    if INTR_USING_LOG
+#        define LOG LOG_D
+#    else
+#        define LOG(...)
+#    endif
 #else
 #    include <string.h>
 #    define upi_printf printf
@@ -29,10 +35,14 @@
 #    define upi_calloc calloc
 #    define upi_memset memset
 #    define upi_memcpy memcpy
-#    define LOG(FMT, ...)                                                                                                                  \
-        do {                                                                                                                               \
-            upi_printf("[upi:%s] " FMT "\r\n", __func__, ##__VA_ARGS__);                                                                   \
-        } while (0)
+#    if INTR_USING_LOG
+#        define LOG(FMT, ...)                                                                                                                                  \
+            do {                                                                                                                                               \
+                upi_printf("[upi:%s] " FMT "\r\n", __func__, ##__VA_ARGS__);                                                                                   \
+            } while (0)
+#    else
+#        define LOG(...)
+#    endif
 #endif
 
 typedef struct interactor {
@@ -99,9 +109,9 @@ static void *interactorReadThread(void *param) {
             msg->len       = size;
             if (intr->add_to_mq == true) {
                 upi_memcpy(msg->buf, intr->rx_buf, msg->len);
-                int ret = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
-                LOG("mq_send ret = %d", ret);
                 intr->add_to_mq = false;
+                int ret         = mq_send(intr->rx_mq, (const char *)msg, sizeof(intr_msg), 0);
+                LOG("mq_send ret = %d", ret);
             } else if (msg->buf != NULL) {
                 upi_memcpy(msg->buf, intr->rx_buf, msg->len);
                 inURMROM(intr, msg);
@@ -213,6 +223,7 @@ bool interactorRequest(interactor_t intr, void *req, size_t req_len, void *resp,
         _interactor_t   _intr = (_interactor_t)intr;
         struct timespec ts;
         ssize_t         ret = -1;
+        intr_msg        msg = {0};
 
         // 1. lock the request
         pthread_mutex_lock(&_intr->lock);
@@ -228,7 +239,6 @@ bool interactorRequest(interactor_t intr, void *req, size_t req_len, void *resp,
         ts.tv_sec += (timeout_ms / 1000);
         ts.tv_nsec += ((timeout_ms % 1000) * 1000ULL);
         LOG("ts.tv_sec = %d, ts.tv_nsec = %d", (int)ts.tv_sec, (int)ts.tv_nsec);
-        intr_msg msg;
         ret = mq_timedreceive(_intr->rx_mq, (char *)&msg, sizeof(intr_msg), 0, &ts);
     __unlock:
         // 4. unlock the request
@@ -247,6 +257,7 @@ bool interactorRequest(interactor_t intr, void *req, size_t req_len, void *resp,
             }
             LOG("Request: %.*s", (int)msg.len, (char *)msg.buf);
             upi_free(msg.buf);
+            return true;
         }
     }
     return false;
